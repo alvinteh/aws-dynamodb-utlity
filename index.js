@@ -9,8 +9,6 @@ const IS_LAMBDA = !!process.env.LAMBDA_TASK_ROOT;
 program
     .requiredOption('-o, --operation <operation>', 'Operation to perform (init/enable/disable)', process.env.operation)
     .requiredOption('-r, --region <region>', 'AWS region)', process.env.region)
-    .option('-b, --batch <batch_size>', 'Batch size)', process.env.batch || 5)
-    .option('-f, --function <lambda_function_name>', 'Lambda function name)', process.env.function)
     .option('-l, --log <log_level>', 'Logging level (error/warn/info)', process.env.log || 'info');
 program.parse(process.argv);
 
@@ -43,7 +41,6 @@ AWS.config.update({ region: options.region });
 
 // Create references to AWS services
 const dynamodb = new AWS.DynamoDB();
-const lambda = new AWS.Lambda();
 
 // Define operation scripts
 const scripts = {};

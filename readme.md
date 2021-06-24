@@ -21,7 +21,7 @@ This utility script helps perform tasks related to migrating DynamoDB tables acr
 3. Create your Lambda function and deploy it. Take note of its name.
 4. Enable DynamoDB streams on each of your DynamoDB tables.
 5. Run the `init` operation:
-
+    node index.js -o init -r <aws_region>
 
 ## Remarks
 
