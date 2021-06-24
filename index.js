@@ -1,3 +1,5 @@
+const fs = require('fs');
+
 const AWS = require('aws-sdk');
 const { program } = require('commander');
 const winston = require('winston');
@@ -10,6 +12,9 @@ program
     .requiredOption('-o, --operation <operation>', 'Operation to perform (init/enable/disable)', process.env.operation)
     .requiredOption('-r, --region <region>', 'AWS region)', process.env.region)
     .requiredOption('-i, --role <iam_role_arn>', 'Destination account IAM role to be assumed)', process.env.iamRole)
+    .requiredOption('--exports_bucket <bucket_name>', 'Destination account S3 bucket for DynamoDB exports', process.env.glueBucket)
+    .requiredOption('--glue_bucket <bucket_name>', 'Destination account S3 bucket for Glue scripts', process.env.glueBucket)
+    .requiredOption('--glue_role <iam_role_arn>', 'Destination account IAM role to be set for Glue jobs', process.env.glueRole)
     .option('-l, --log <log_level>', 'Logging level (error/warn/info)', process.env.log || 'info');
 program.parse(process.argv);
 
@@ -75,6 +80,8 @@ scripts.init = async () => {
 
     const sourceDynamodb = new AWS.DynamoDB();
     const destDynamodb = new AWS.DynamoDB(destAccountCredentials);
+    const destS3 = new AWS.S3(destAccountCredentials);
+    const destGlue = new AWS.Glue(destAccountCredentials);
 
     // Get source tables
     const tableNames = await new Promise((resolve, reject) => {
@@ -111,7 +118,6 @@ scripts.init = async () => {
 
     const tables = await Promise.all(describeTablePromises);
 
-    /*
     // Enable PITR for each table
     const enablePitrPromises = [];
 
@@ -174,7 +180,6 @@ scripts.init = async () => {
 
     await Promise.all(updateTablePromises);
     logger.info(`Completed enabling DynamoDB streams for ${enablePitrPromises.length} tables`);
-    */
 
     // Get destination tables
     const destTableNames = await new Promise((resolve, reject) => {
@@ -231,6 +236,106 @@ scripts.init = async () => {
 
     await Promise.all(createTablePromises);
     logger.info(`Completed creating ${createTablePromises.length} tables`);
+
+    // Create Glue scripts and upload them to S3
+    const createGlueScriptPromises = [];
+
+    // Load template
+    let scriptTemplate = fs.readFileSync('data/glue-script-template.py', 'utf8');
+    scriptTemplate = scriptTemplate.replace(/%%REGION%%/g, options.region);
+
+    tables.forEach((table) => {
+        const tableName = table.name;
+
+        const promise = new Promise((resolve, reject) => {
+            // Make a copy of the script (the weirdness is to force a copy instead of a reference)
+            let script = (' ' + scriptTemplate).slice(1);
+
+            // TO-DO: Update this with the path to the actual table
+            script = scriptTemplate.replace(/%%EXPORTS_BUCKET%%/g, `${options.exports_bucket}/exports/${tableName}/`);
+ 
+            // Replace table name
+            script = script.replace(/%%TABLE%%/g, tableName);
+
+            // TO-DO: Construct mappings (AttributeDefinitions only contains key attributes)
+            const mappings = table.config.AttributeDefinitions.map((attribute) => {
+                const { AttributeName: name, AttributeType: type } = attribute;
+
+                // TO-DO: Expand support beyond number, string and boolean types
+                const glueType = (() => {
+                    switch (type) {
+                        case 'N':
+                            return 'long';
+                        case 'S':
+                            return 'string';
+                        case 'BOOL':
+                            return 'boolean';
+                        default:
+                            return 'string';
+                    }
+                })();
+
+                return `("Item.${name}.${type}", "string", "${name}", "${glueType}")`
+            });
+
+            // Replace mappings
+            script = script.replace(/%%MAPPINGS%%/g, mappings.join(','));
+
+            // Upload script to S3
+            destS3.putObject({
+                Body: script, 
+                Bucket: options.glue_bucket, 
+                Key: `glue-script-${tableName}.py`
+            }).promise()
+            .then(() => {
+                logger.info(`Uploaded Glue script for table ${tableName}`);
+                resolve(tableName);
+            })
+            .catch((error) => {
+                logger.error(`Failed to upload Glue script for table ${tableName}`);
+                reject(error);
+            });
+        });
+    });
+
+    await Promise.all(createGlueScriptPromises);
+    logger.info(`Completed creating ${createTablePromises.length} Glue script files`);
+
+    // Create Glue jobs
+    const createJobPromises = [];
+
+    tables.forEach((table) => {
+        const tableName = table.name;
+
+        const promise = new Promise((resolve, reject) => {
+            destGlue.createJob({
+                Name: `ddb-job-${tableName}`,
+                Role: options.glue_role,
+                Command: {
+                    Name: 'glueetl',
+                    PythonVersion: '3',
+                    ScriptLocation: `s3://${options.glue_bucket}/glue-script-${tableName}.py`
+                },
+                Description: `Glue job for ${tableName}`,
+                MaxRetries: 0,
+                NumberOfWorkers: 10,
+                WorkerType: 'G.1X'
+            }).promise()
+            .then(() => {
+                logger.info(`Created Glue job for table ${tableName}`);
+                resolve(tableName);
+            })
+            .catch((error) => {
+                logger.error(`Failed to Glue job for table ${tableName}`);
+                reject(error);
+            });
+        });
+
+        createJobPromises.push(promise);
+    });
+
+    await Promise.all(createJobPromises);
+    logger.info(`Completed creating ${createJobPromises.length} Glue jobs`);
 
 };
 
