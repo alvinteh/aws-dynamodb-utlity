@@ -9,6 +9,7 @@ const IS_LAMBDA = !!process.env.LAMBDA_TASK_ROOT;
 program
     .requiredOption('-o, --operation <operation>', 'Operation to perform (init/enable/disable)', process.env.operation)
     .requiredOption('-r, --region <region>', 'AWS region)', process.env.region)
+    .requiredOption('-i, --role <iam_role_arn>', 'Destination account IAM role to be assumed)', process.env.iamRole)
     .option('-l, --log <log_level>', 'Logging level (error/warn/info)', process.env.log || 'info');
 program.parse(process.argv);
 
@@ -39,16 +40,45 @@ const logger = winston.createLogger({
 
 AWS.config.update({ region: options.region });
 
-// Create references to AWS services
-const dynamodb = new AWS.DynamoDB();
+// Define function to get destination account role STS credentials
+const getCrossAccountCredentials = async () => {
+    const sts = new AWS.STS();
+
+    return new Promise((resolve, reject) => {
+        const timestamp = (new Date()).getTime();
+        const params = {
+            RoleArn: options.role,
+            RoleSessionName: `ddb-utlity-${timestamp}`
+        };
+
+        sts.assumeRole(params, (error, data) => {
+            if (error) {
+                reject(error);
+            }
+            else {
+                resolve({
+                    accessKeyId: data.Credentials.AccessKeyId,
+                    secretAccessKey: data.Credentials.SecretAccessKey,
+                    sessionToken: data.Credentials.SessionToken,
+                });
+            }
+        });
+    });
+};
 
 // Define operation scripts
 const scripts = {};
 
 scripts.init = async () => {
-    // Get tables
+    // Get destination account credentials 
+    const destAccountCredentials = await getCrossAccountCredentials();
+
+    const sourceDynamodb = new AWS.DynamoDB();
+    const destDynamodb = new AWS.DynamoDB(destAccountCredentials);
+
+    // Get source tables
     const tableNames = await new Promise((resolve, reject) => {
-        dynamodb.listTables({}).promise()
+        sourceDynamodb.listTables({}).promise()
         .then((data) => {
             resolve(data.TableNames);
         })
@@ -63,7 +93,7 @@ scripts.init = async () => {
 
     tableNames.forEach((tableName) => {
         const promise = new Promise((resolve, reject) => {
-            dynamodb.describeTable({ TableName: tableName }).promise()
+            sourceDynamodb.describeTable({ TableName: tableName }).promise()
             .then((data) => {
                 resolve({
                     name: tableName,
@@ -81,6 +111,7 @@ scripts.init = async () => {
 
     const tables = await Promise.all(describeTablePromises);
 
+    /*
     // Enable PITR for each table
     const enablePitrPromises = [];
 
@@ -88,22 +119,22 @@ scripts.init = async () => {
         const tableName = table.name;
 
         const promise = new Promise((resolve, reject) => {
-            dynamodb.updateContinuousBackups(
+            sourceDynamodb.updateContinuousBackups(
                 {
                     TableName: tableName,
                     PointInTimeRecoverySpecification: {
-                        PointInTimeRecoveryEnabled: true 
+                        PointInTimeRecoveryEnabled: true
                     },
                 }
             ).promise()
-            .then(() => {
-                logger.info(`Enabled PITR for table ${tableName}`);
-                resolve(tableName);
-            })
-            .catch((error) => {
-                logger.error(`Failed to enable PITR for table ${tableName}`);
-                reject(error);
-            });
+                .then(() => {
+                    logger.info(`Enabled PITR for table ${tableName}`);
+                    resolve(tableName);
+                })
+                .catch((error) => {
+                    logger.error(`Failed to enable PITR for table ${tableName}`);
+                    reject(error);
+                });
         });
 
         enablePitrPromises.push(promise);
@@ -119,7 +150,7 @@ scripts.init = async () => {
         const tableName = table.name;
 
         const promise = new Promise((resolve, reject) => {
-            dynamodb.updateTable(
+            sourceDynamodb.updateTable(
                 {
                     TableName: tableName,
                     StreamSpecification: {
@@ -143,6 +174,63 @@ scripts.init = async () => {
 
     await Promise.all(updateTablePromises);
     logger.info(`Completed enabling DynamoDB streams for ${enablePitrPromises.length} tables`);
+    */
+
+    // Get destination tables
+    const destTableNames = await new Promise((resolve, reject) => {
+        destDynamodb.listTables({}).promise()
+        .then((data) => {
+            resolve(data.TableNames);
+        })
+        .catch((error) => {
+            logger.error(`Failed to retrieve tables`);
+            reject(error);
+        });
+    }); 
+
+    // Create DynamoDB tables
+    const createTablePromises = [];
+
+    tables.forEach((table) => {
+        const tableName = table.name;
+
+        // Skip creation of table if it already exists
+        if (destTableNames.indexOf(tableName) !== -1) {
+            return;
+        }
+
+        const promise = new Promise((resolve, reject) => {
+            const params = Object.assign({ TableName: tableName }, table.config);
+
+            delete params.CreationDateTime;
+            delete params.ItemCount;
+            delete params.LastDecreaseDateTime;
+            delete params.LatestStreamArn;
+            delete params.LatestStreamLabel;
+            delete params.NumberOfDecreasesToday;
+            delete params.TableArn;
+            delete params.TableId;
+            delete params.TableSizeBytes;
+            delete params.TableStatus;
+            delete params.ProvisionedThroughput.LastDecreaseDateTime;
+            delete params.ProvisionedThroughput.NumberOfDecreasesToday;
+
+            destDynamodb.createTable(params).promise()
+            .then(() => {
+                logger.info(`Created table ${tableName}`);
+                resolve(tableName);
+            })
+            .catch((error) => {
+                logger.error(`Failed to create DynamoDB table ${tableName}`);
+                reject(error);
+            });
+        });
+
+        createTablePromises.push(promise);
+    });
+
+    await Promise.all(createTablePromises);
+    logger.info(`Completed creating ${createTablePromises.length} tables`);
 
 };
 
